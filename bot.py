@@ -6,9 +6,9 @@ import asyncio
 import logging
 import datetime
 import uuid
-import requests
+import aiohttp
 from io import BytesIO
-from html import escape  # For HTML escaping in filenames
+from html import escape
 from flask import Flask
 from pyrogram import Client, filters, enums, idle
 from pyrogram.types import (
@@ -21,17 +21,21 @@ from pyrogram.types import (
 # Configuration
 API_ID = int(os.environ.get('API_ID', 28593211))
 API_HASH = os.environ.get('API_HASH', '27ad7de4fe5cab9f8e310c5cc4b8d43d')
-BOT_TOKEN = os.environ.get('BOT_TOKEN', '')
+BOT_TOKEN = os.environ.get('BOT_TOKEN', '7286908099:AAG7rHzCaSoDl5yVFV1mwF0X5-DrIpHYANI')
 DATABASE_URL = os.environ.get('DATABASE_URL', 'bot.db')
 ADMIN_USER_ID = int(os.environ.get('ADMIN_USER_ID', 5559075560))
 PORT = int(os.environ.get('PORT', 5000))
-FORWARD_CHANNEL = os.environ.get('FORWARD_CHANNEL')  # New environment variable for channel
+FORWARD_CHANNEL = os.environ.get('FORWARD_CHANNEL')
+MEMORY_THRESHOLD = 100 * 1024 * 1024  # 100MB
 
 # Initialize
 app = Flask(__name__)
 bot = Client("file-transfer-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Memory cache for thumbnails
+THUMBNAIL_CACHE = {}
 
 # Database setup with schema migration
 def init_db():
@@ -154,15 +158,26 @@ def format_size(size):
 
 # New thumbnail helper functions
 def set_thumbnail(user_id, file_id, file_unique_id):
+    THUMBNAIL_CACHE[user_id] = (file_id, file_unique_id)  # Update cache
     db_execute(
         "INSERT OR REPLACE INTO thumbnails (user_id, file_id, file_unique_id) VALUES (?, ?, ?)",
         (user_id, file_id, file_unique_id)
     )
 
 def get_thumbnail(user_id):
-    return db_execute("SELECT * FROM thumbnails WHERE user_id = ?", (user_id,), fetchone=True)
+    # Check cache first
+    if user_id in THUMBNAIL_CACHE:
+        return {'file_id': THUMBNAIL_CACHE[user_id][0], 'file_unique_id': THUMBNAIL_CACHE[user_id][1]}
+    
+    # Fallback to database
+    thumb = db_execute("SELECT * FROM thumbnails WHERE user_id = ?", (user_id,), fetchone=True)
+    if thumb:
+        THUMBNAIL_CACHE[user_id] = (thumb['file_id'], thumb['file_unique_id'])
+    return thumb
 
 def delete_thumbnail(user_id):
+    if user_id in THUMBNAIL_CACHE:
+        del THUMBNAIL_CACHE[user_id]
     db_execute("DELETE FROM thumbnails WHERE user_id = ?", (user_id,))
 
 # New pending downloads helpers
@@ -189,7 +204,7 @@ def get_forward_channel():
     row = db_execute("SELECT channel_id FROM forward_channel", fetchone=True)
     return row['channel_id'] if row else None
 
-# Progress handler
+# Optimized progress handler
 class Progress:
     def __init__(self, message: Message, start_time):
         self.message = message
@@ -197,34 +212,33 @@ class Progress:
         self.last_update = start_time
         self.current = 0
         self.total = 0
-        self.speeds = []
-        self.last_speed = 0
         
     async def progress_callback(self, current, total):
         self.current = current
         self.total = total
         
         now = datetime.datetime.now()
-        if (now - self.last_update).seconds >= 1 or total == current:
+        # Update every 2 seconds or when completed
+        if (now - self.last_update).seconds >= 2 or total == current:
             elapsed = (now - self.start_time).seconds or 1  # Prevent division by zero
-            speed = (current - self.last_speed) / 1024  # KB/s
-            self.speeds.append(speed)
-            avg_speed = sum(self.speeds) / len(self.speeds) if self.speeds else 0
+            speed = current / elapsed / 1024  # KB/s
             
             # Format progress
             percentage = (current / total) * 100 if total > 0 else 100
             progress_bar = "[" + "■" * int(percentage/5) + "□" * (20 - int(percentage/5)) + "]"
-            speed_str = f"{avg_speed:.2f} KB/s" if avg_speed < 1024 else f"{avg_speed/1024:.2f} MB/s"
+            speed_str = f"{speed:.2f} KB/s" if speed < 1024 else f"{speed/1024:.2f} MB/s"
             
             # Calculate ETA
-            eta = (total - current) / (avg_speed * 1024) if avg_speed > 0 else 0
-            eta_str = str(datetime.timedelta(seconds=int(eta))) if eta > 0 else "Calculating..."
+            if speed > 0:
+                eta = (total - current) / (speed * 1024)
+                eta_str = str(datetime.timedelta(seconds=int(eta)))
+            else:
+                eta_str = "Calculating..."
             
             # Create message
             text = (
                 f"**Transferring...**\n"
                 f"{progress_bar} {percentage:.1f}%\n"
-                f"**Size:** {format_size(total)}\n"
                 f"**Speed:** {speed_str}\n"
                 f"**ETA:** {eta_str}"
             )
@@ -235,48 +249,42 @@ class Progress:
                 logger.warning(f"Progress update failed: {str(e)}")
             
             self.last_update = now
-            self.last_speed = current
 
 # Bot handlers
 @bot.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
-    # Regular start command
     user = get_user(message.from_user.id)
     await message.reply_text(
-        "📁 **File Transfer Bot**\n\n"
-        "Send me any direct download link and I'll help you transfer it to Telegram!\n\n"
-        "**Features:**\n"
-        "• Direct download from any direct links\n"
-        "• Real-time download progress\n"
-        "• Fast Telegram uploads\n"
-        "• Custom thumbnails\n"
-        "• File format selection\n\n"
-        "Use /help for full commands list",
+        "⚡ **Ultra-Fast File Transfer Bot**\n\n"
+        "Send me any direct download link and I'll transfer it to Telegram at blazing speed!\n\n"
+        "**Optimized Features:**\n"
+        "• Async downloads with aiohttp\n"
+        "• Memory-based processing\n"
+        "• Network optimizations\n"
+        "• Reduced disk I/O\n\n"
+        "Use /help for commands",
         reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("ℹ️ About", callback_data="about")  # New About button
-            ]
+            [InlineKeyboardButton("ℹ️ About", callback_data="about")]
         ])
     )
 
 @bot.on_message(filters.command("help"))
 async def help_command(client: Client, message: Message):
     await message.reply_text(
-        "🛠 **Bot Commands:**\n\n"
+        "🚀 **Optimized Bot Commands:**\n\n"
         "/start - Welcome message\n"
         "/help - Show this help\n"
         "/stats - Show bot statistics\n"
         "/sethumbnail - Set a custom thumbnail (reply to an image)\n"
         "/viewthumbnail - View your current thumbnail\n"
         "/delthumbnail - Delete your thumbnail\n"
-        "/addchannel - Set forwarding channel (admin only)\n"  # New command
-        "/viewchannel - View current channel (admin only)\n"  # New command
-        "\n"
+        "/addchannel - Set forwarding channel (admin only)\n"
+        "/viewchannel - View current channel (admin only)\n\n"
         "**How to use:**\n"
         "1. Send any direct download link\n"
         "2. I'll download and show file info\n"
-        "3. Choose upload format (if applicable)\n"
-        "4. I'll upload to Telegram automatically\n"
+        "3. Choose upload format\n"
+        "4. I'll upload to Telegram at maximum speed\n"
     )
 
 @bot.on_message(filters.command("stats"))
@@ -287,10 +295,11 @@ async def stats_command(client: Client, message: Message):
         return
         
     await message.reply_text(
-        f"📊 **Bot Statistics:**\n\n"
+        f"📊 **Performance Statistics:**\n\n"
         f"• Total Users: `{stats['users']}`\n"
         f"• Files Downloaded: `{stats['downloads']}`\n"
-        f"• Files Uploaded: `{stats['uploads']}`"
+        f"• Files Uploaded: `{stats['uploads']}`\n"
+        f"• Memory Threshold: `{format_size(MEMORY_THRESHOLD)}`"
     )
 
 # ===== THUMBNAIL COMMANDS =====
@@ -301,7 +310,6 @@ async def set_thumbnail_command(client: Client, message: Message):
         return
 
     if message.reply_to_message.photo:
-        # Use largest photo size
         file_id = message.reply_to_message.photo.file_id
         file_unique_id = message.reply_to_message.photo.file_unique_id
     elif (message.reply_to_message.document and 
@@ -362,13 +370,16 @@ async def about_callback(client: Client, callback_query: CallbackQuery):
     await callback_query.answer()
     bot_username = (await client.get_me()).username
     await callback_query.message.edit_text(
-        f"🤖 **File Transfer Bot**\n\n"
+        f"⚡ **Ultra-Fast File Transfer Bot**\n\n"
         f"**Developer:** [ORFIAI DEV](https://t.me/orfiai_dev)\n"
         f"**Bot Username:** @{bot_username}\n\n"
+        "**Optimizations:**\n"
+        "- Async aiohttp downloads\n"
+        "- Memory-based processing\n"
+        "- Network optimizations\n"
+        "- Reduced disk I/O\n\n"
         "**Source Code:** [BUY](https://t.me/realemonfx)\n"
-        "**Channel:** [ORFIAI](https://t.me/orfiai)\n\n"
-        "This bot is actively maintained and updated regularly. "
-        "Feel free to contribute to the project on GitHub!",
+        "**Channel:** [ORFIAI](https://t.me/orfiai)",
         disable_web_page_preview=True,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Back", callback_data="back_to_start")]
@@ -380,14 +391,12 @@ async def back_to_start(client: Client, callback_query: CallbackQuery):
     await callback_query.answer()
     await start_command(client, callback_query.message)
 
-# ===== LINK HANDLER WITH FORMAT SELECTION =====
+# ===== OPTIMIZED LINK HANDLER =====
 @bot.on_message(filters.text & filters.private)
 async def handle_links(client: Client, message: Message):
-    # Skip commands
     if message.text.startswith('/'):
         return
     
-    # Handle URL
     url = message.text.strip()
     if not re.match(r'https?://(?:[-\w.]|(?:%[\da-fA-F]{2}))+', url):
         return
@@ -395,45 +404,47 @@ async def handle_links(client: Client, message: Message):
     msg = await message.reply_text("🔍 Analyzing URL...")
     
     try:
-        # Get file info
-        head = requests.head(url, allow_redirects=True, timeout=10)
-        content_length = head.headers.get('content-length')
-        content_type = head.headers.get('content-type', '')
-        filename = os.path.basename(url)
-        
-        if not content_length:
-            raise Exception("Could not determine file size")
-            
-        file_size = int(content_length)
-        
-        # Save as pending download and ask for format
-        pending_id = create_pending_download(
-            message.from_user.id,
-            url,
-            filename,
-            file_size,
-            content_type
-        )
-        
-        # Create format selection buttons
-        buttons = []
-        if 'video' in content_type:
-            buttons.append(InlineKeyboardButton("Video", callback_data=f"format:{pending_id}:video"))
-        buttons.append(InlineKeyboardButton("Document", callback_data=f"format:{pending_id}:document"))
-        
-        await msg.edit_text(
-            f"📥 **File Information:**\n\n"
-            f"• **File Name:** `{filename}`\n"
-            f"• **File Size:** `{format_size(file_size)}`\n\n"
-            f"Please choose upload format:",
-            reply_markup=InlineKeyboardMarkup([buttons])
-        )
-        
+        # Use async HEAD request for speed
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, allow_redirects=True, timeout=10) as response:
+                content_length = response.headers.get('content-length')
+                content_type = response.headers.get('content-type', '')
+                
+                if not content_length:
+                    raise Exception("Could not determine file size")
+                    
+                file_size = int(content_length)
+                filename = os.path.basename(url)
+                
+                # Save as pending download and ask for format
+                pending_id = create_pending_download(
+                    message.from_user.id,
+                    url,
+                    filename,
+                    file_size,
+                    content_type
+                )
+                
+                # Create format selection buttons
+                buttons = []
+                if 'video' in content_type:
+                    buttons.append(InlineKeyboardButton("Video", callback_data=f"format:{pending_id}:video"))
+                buttons.append(InlineKeyboardButton("Document", callback_data=f"format:{pending_id}:document"))
+                
+                await msg.edit_text(
+                    f"📥 **File Information:**\n\n"
+                    f"• **File Name:** `{filename}`\n"
+                    f"• **File Size:** `{format_size(file_size)}`\n"
+                    f"• **Processing:** `{'Memory' if file_size < MEMORY_THRESHOLD else 'Disk'}`\n\n"
+                    f"Please choose upload format:",
+                    reply_markup=InlineKeyboardMarkup([buttons])
+                )
+                
     except Exception as e:
         logger.error(f"Download error: {str(e)}", exc_info=True)
         await msg.edit_text(f"❌ Error: {str(e)}")
 
-# ===== CALLBACK HANDLER FOR FORMAT SELECTION =====
+# ===== OPTIMIZED DOWNLOAD HANDLER =====
 @bot.on_callback_query(filters.regex(r"^format:"))
 async def format_choice_callback(client: Client, callback_query: CallbackQuery):
     data = callback_query.data.split(':')
@@ -454,7 +465,7 @@ async def format_choice_callback(client: Client, callback_query: CallbackQuery):
     delete_pending_download(pending_id)
     
     await callback_query.answer(f"Starting {format_choice} upload...")
-    msg = await callback_query.message.edit_text("Starting download...")
+    msg = await callback_query.message.edit_text("🚀 Starting optimized download...")
     
     try:
         url = pending['url']
@@ -462,104 +473,120 @@ async def format_choice_callback(client: Client, callback_query: CallbackQuery):
         file_size = pending['file_size']
         content_type = pending['content_type']
         
-        # Start download
         start_time = datetime.datetime.now()
         progress = Progress(msg, start_time)
         
-        # Download file
-        response = requests.get(url, stream=True, timeout=300)
-        response.raise_for_status()
+        # Determine processing method based on file size
+        use_memory = file_size < MEMORY_THRESHOLD
+        file_obj = BytesIO() if use_memory else None
+        temp_file = None
         
-        # Create temporary file
-        temp_file = f"downloads/{filename}"
-        os.makedirs("downloads", exist_ok=True)
-        
-        with open(temp_file, 'wb') as f:
-            downloaded = 0
-            last_update = start_time
-            
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    
-                    now = datetime.datetime.now()
-                    if (now - last_update).seconds >= 1 or downloaded == file_size:
+        # Download with optimized chunk size
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=300) as response:
+                response.raise_for_status()
+                
+                # Large chunk size for better throughput
+                chunk_size = 131072  # 128KB chunks
+                downloaded = 0
+                
+                if use_memory:
+                    # In-memory download for faster processing
+                    async for chunk in response.content.iter_chunked(chunk_size):
+                        file_obj.write(chunk)
+                        downloaded += len(chunk)
                         await progress.progress_callback(downloaded, file_size)
-                        last_update = now
+                    file_obj.seek(0)
+                else:
+                    # Disk download for large files
+                    temp_file = f"downloads/{filename}"
+                    os.makedirs("downloads", exist_ok=True)
+                    with open(temp_file, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(chunk_size):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            await progress.progress_callback(downloaded, file_size)
         
         increment_downloads()
-        
-        # Get user's thumbnail if exists
         thumbnail = get_thumbnail(callback_query.from_user.id)
         thumbnail_file_id = thumbnail['file_id'] if thumbnail else None
         
-        # Upload with selected format
+        # Upload from memory or disk
         await upload_file(
             client, 
             msg, 
-            temp_file, 
+            file_obj if use_memory else temp_file, 
             filename, 
             content_type, 
             file_size,
-            url,  # Pass original URL
+            url,
             as_video=(format_choice == "video"),
-            thumbnail=thumbnail_file_id
+            thumbnail=thumbnail_file_id,
+            is_memory=use_memory
         )
         
     except Exception as e:
         logger.error(f"Download error: {str(e)}", exc_info=True)
         await msg.edit_text(f"❌ Error: {str(e)}")
+        # Cleanup
+        if file_obj:
+            file_obj.close()
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except:
+                pass
 
-# ===== UPLOAD FUNCTION WITH STYLED FILENAME CAPTION AND CHANNEL FORWARDING =====
+# ===== ULTRA-FAST UPLOAD FUNCTION =====
 async def upload_file(
     client: Client, 
     message: Message, 
-    filepath, 
+    file_ref, 
     filename, 
     content_type, 
     file_size,
-    original_url,  # Added original URL parameter
+    original_url,
     as_video=False,
-    thumbnail=None
+    thumbnail=None,
+    is_memory=False
 ):
-    msg = await message.edit_text("📤 Uploading file to Telegram...")
+    msg = await message.edit_text("⚡ Turbo upload in progress...")
     start_time = datetime.datetime.now()
     progress = Progress(msg, start_time)
     
     try:
-        # Handle thumbnail properly
+        # Thumbnail handling with cache
         thumbnail_bytes = None
         if thumbnail:
-            try:
-                # Download thumbnail to memory
-                thumbnail_data = await client.download_media(thumbnail, in_memory=True)
-                if thumbnail_data:
-                    # Move to the end to get the size
-                    thumbnail_data.seek(0, 2)
-                    size = thumbnail_data.tell()
-                    # Move back to the beginning
-                    thumbnail_data.seek(0)
-                    if size == 0:
-                        logger.warning("Downloaded thumbnail has 0 bytes, skipping")
-                    else:
-                        thumbnail_data.name = "thumbnail.jpg"
-                        thumbnail_bytes = thumbnail_data
-            except Exception as e:
-                logger.error(f"Failed to download thumbnail: {str(e)}")
+            # Try to get from cache
+            if thumbnail in THUMBNAIL_CACHE.values():
+                # Already in memory
+                pass
+            else:
+                try:
+                    # Download thumbnail to memory
+                    thumbnail_data = await client.download_media(thumbnail, in_memory=True)
+                    if thumbnail_data:
+                        # Check if valid image
+                        thumbnail_data.seek(0, 2)
+                        if thumbnail_data.tell() > 0:
+                            thumbnail_data.seek(0)
+                            thumbnail_bytes = thumbnail_data
+                        else:
+                            logger.warning("Downloaded thumbnail has 0 bytes, skipping")
+                except Exception as e:
+                    logger.error(f"Thumbnail error: {str(e)}")
 
-        # Get bot username for caption
+        # Prepare caption
         bot_username = (await client.get_me()).username
-
-        # Prepare file caption with styled filename
-        styled_filename = f"<code>{escape(filename)}</code>"  # Stylish monospace formatting
+        styled_filename = f"<code>{escape(filename)}</code>"
         file_caption = f"@{bot_username} {styled_filename}"
 
-        # Determine file type with format choice
+        # Upload directly from memory or file
         if as_video and 'video' in content_type:
             sent_msg = await client.send_video(
                 chat_id=message.chat.id,
-                video=filepath,
+                video=file_ref,
                 file_name=filename,
                 caption=file_caption,
                 parse_mode=enums.ParseMode.HTML,
@@ -571,7 +598,7 @@ async def upload_file(
         else:
             sent_msg = await client.send_document(
                 chat_id=message.chat.id,
-                document=filepath,
+                document=file_ref,
                 file_name=filename,
                 caption=file_caption,
                 parse_mode=enums.ParseMode.HTML,
@@ -599,41 +626,42 @@ async def upload_file(
                     f"❌ Failed to forward file to channel {channel_id}:\n{str(e)}"
                 )
         
-        # Final progress update
-        await progress.progress_callback(file_size, file_size)
-        await asyncio.sleep(1)  # Let user see 100% progress
-        
+        # Final message
         await msg.edit_text(
-            f"✅ **File uploaded successfully!**\n\n"
-            f"• **File Name:** `{filename}`\n"
-            f"• **File Size:** `{format_size(file_size)}`\n"
-            f"• **Format:** {'Video' if as_video else 'Document'}\n\n"
-            f"🔗 Direct Link: `{original_url}`"
+            f"✅ **Upload completed!**\n\n"
+            f"• **File:** `{filename}`\n"
+            f"• **Size:** `{format_size(file_size)}`\n"
+            f"• **Method:** {'Memory' if is_memory else 'Disk'}\n"
+            f"• **Speed:** Optimized"
         )
-        
-        # Clean up
-        try:
-            os.remove(filepath)
-        except Exception as e:
-            logger.error(f"Error deleting file: {str(e)}")
         
     except Exception as e:
         logger.error(f"Upload error: {str(e)}", exc_info=True)
         await msg.edit_text(f"❌ Upload failed: {str(e)}")
-        try:
-            os.remove(filepath)
-        except:
-            pass
+    finally:
+        # Cleanup resources
+        if is_memory:
+            file_ref.close()
+        elif file_ref and os.path.exists(file_ref):
+            try:
+                os.remove(file_ref)
+            except:
+                pass
 
-# Run the bot
+# Run the bot with optimized settings
 async def run_bot():
     await bot.start()
-    logging.info("Bot started")
+    logging.info("Bot started with performance optimizations")
     
-    # Notify admin about channel status
+    # Notify admin
     channel_id = get_forward_channel()
-    channel_status = f"Channel ID: {channel_id}" if channel_id else "No channel set"
-    await bot.send_message(ADMIN_USER_ID, f"✅ Bot started successfully!\n{channel_status}")
+    channel_status = f"Forwarding Channel: {channel_id}" if channel_id else "No forwarding channel"
+    await bot.send_message(
+        ADMIN_USER_ID, 
+        f"⚡ Turbo Mode Activated!\n"
+        f"• Memory Threshold: {format_size(MEMORY_THRESHOLD)}\n"
+        f"• {channel_status}"
+    )
     
     await idle()
 
@@ -647,7 +675,15 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
     
-    # Run the bot with graceful shutdown
+    # Run the bot with uvloop if available
+    try:
+        import uvloop
+        uvloop.install()
+        logger.info("Using uvloop for enhanced performance")
+    except ImportError:
+        logger.info("Using standard asyncio event loop")
+    
+    # Run the bot
     loop = asyncio.get_event_loop()
     try:
         loop.run_until_complete(run_bot())
